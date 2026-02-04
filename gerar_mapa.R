@@ -1,0 +1,334 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIG FIXA — diretório padrão (Mapas R)
+# ──────────────────────────────────────────────────────────────────────────────
+BASE_DIR <- "C:/Users/noteb/OneDrive - fnp.org.br/Área de Trabalho/Mapas R"
+
+# (opcional) se quiser garantir que tudo rode a partir desse diretório:
+# setwd(BASE_DIR)
+
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(
+  tidyverse, readxl, sf, geobr, leaflet, htmlwidgets, htmltools, base64enc
+)
+
+options(scipen = 999)
+sf::sf_use_s2(FALSE)
+options(jsonlite.warn_vec_names = FALSE)
+
+.escolher_aba_console <- function(abas) {
+  aba_default <- if ("CASD" %in% abas) "CASD" else abas[1]
+  
+  repeat {
+    cat("\nAbas disponíveis no arquivo:\n")
+    for (i in seq_along(abas)) cat("  ", i, ") ", abas[i], "\n", sep = "")
+    cat("\nDigite o NÚMERO (ex.: 1) ou o NOME (ex.: CASD). ENTER = ", aba_default, "\n", sep = "")
+    
+    entrada <- trimws(readline("Escolha a aba: "))
+    if (entrada == "") return(aba_default)
+    
+    if (grepl("^[0-9]+$", entrada)) {
+      idx <- as.integer(entrada)
+      if (!is.na(idx) && idx >= 1 && idx <= length(abas)) return(abas[idx])
+      cat("\n⚠️  Número inválido. Tente de novo.\n")
+      next
+    }
+    
+    match_idx <- match(tolower(entrada), tolower(abas))
+    if (!is.na(match_idx)) return(abas[match_idx])
+    
+    cat("\n⚠️  Não encontrei essa aba. Tente de novo.\n")
+  }
+}
+
+.gerar_pontos_seguro <- function(sf_poligonos_4326) {
+  sf_poligonos_3857 <- sf::st_transform(sf_poligonos_4326, 3857)
+  sf_pontos_3857 <- sf_poligonos_3857 |>
+    dplyr::mutate(geom = sf::st_point_on_surface(geom)) |>
+    sf::st_as_sf()
+  sf::st_transform(sf_pontos_3857, 4326)
+}
+
+gerar_mapa <- function(
+    aba = NULL,
+    titulo = NULL,
+    # ✅ defaults fixos no diretório Mapas R
+    arquivo = file.path(BASE_DIR, "municipios.xlsx"),
+    logo_nome = "FNP_principal.png",
+    # ✅ salva sempre no mesmo diretório (Mapas R)
+    out_dir = BASE_DIR
+    # se preferir subpasta: out_dir = file.path(BASE_DIR, "saida_mapa")
+) {
+  # ── checks
+  if (!dir.exists(BASE_DIR)) stop("Não encontrei o diretório BASE_DIR: ", BASE_DIR)
+  if (!file.exists(arquivo)) stop("Não encontrei o arquivo: ", arquivo)
+  
+  logo_path <- file.path(BASE_DIR, logo_nome)
+  if (!file.exists(logo_path)) stop("Não encontrei a logo: ", logo_path)
+  
+  # ── abas
+  abas <- readxl::excel_sheets(arquivo)
+  
+  # ── resolver aba
+  if (is.null(aba)) {
+    aba <- .escolher_aba_console(abas)
+  } else if (is.numeric(aba)) {
+    if (aba < 1 || aba > length(abas)) stop("Número de aba inválido. Use 1 a ", length(abas))
+    aba <- abas[aba]
+  } else {
+    match_idx <- match(tolower(as.character(aba)), tolower(abas))
+    if (is.na(match_idx)) stop("A aba '", aba, "' não existe. Abas: ", paste(abas, collapse = ", "))
+    aba <- abas[match_idx]
+  }
+  
+  # ── resolver título
+  if (is.null(titulo)) {
+    titulo <- trimws(readline(paste0("Título do mapa (ENTER para usar '", aba, "'): ")))
+    if (titulo == "") titulo <- aba
+  } else {
+    titulo <- as.character(titulo)
+  }
+  
+  cat("\nOK! Aba: ", aba, " | Título: ", titulo, "\n\n", sep = "")
+  
+  # 1) Ler planilha e extrair cod_ibge
+  df <- readxl::read_excel(arquivo, sheet = aba)
+  
+  names(df) <- names(df) |>
+    stringr::str_replace_all("\u00A0", " ") |>
+    stringr::str_squish() |>
+    stringr::str_replace_all(" ", "_") |>
+    stringr::str_to_lower()
+  
+  col_cod <- dplyr::case_when(
+    "cod_ibge" %in% names(df) ~ "cod_ibge",
+    "cod_ibg" %in% names(df) ~ "cod_ibg",
+    "codigo_ibge" %in% names(df) ~ "codigo_ibge",
+    TRUE ~ NA_character_
+  )
+  if (is.na(col_cod)) stop("Não encontrei coluna de IBGE. Colunas: ", paste(names(df), collapse = ", "))
+  
+  municipios_sel <- df |>
+    transmute(cod_ibge = as.integer(.data[[col_cod]])) |>
+    filter(!is.na(cod_ibge)) |>
+    distinct()
+  
+  if (nrow(municipios_sel) == 0) stop("A aba '", aba, "' não tem nenhum cod_ibge válido.")
+  
+  # 2) Mapas (geobr)
+  ler_geobr <- function() {
+    mapa_estados <- geobr::read_state(year = 2020) |> sf::st_transform(4326)
+    mapa_municipios <- geobr::read_municipality(year = 2020) |> sf::st_transform(4326)
+    list(estados = mapa_estados, municipios = mapa_municipios)
+  }
+  
+  geo <- tryCatch(
+    ler_geobr(),
+    error = function(e) {
+      message("Problema ao baixar/ler geobr. Limpando cache e tentando novamente...")
+      geobr::cleanup_geobr()
+      ler_geobr()
+    }
+  )
+  
+  mapa_estados <- geo$estados
+  mapa_municipios <- geo$municipios
+  
+  # 3) Filtrar municípios e gerar pontos
+  municipios_geo <- mapa_municipios |>
+    filter(code_muni %in% municipios_sel$cod_ibge)
+  
+  cods_faltando <- setdiff(municipios_sel$cod_ibge, municipios_geo$code_muni)
+  if (length(cods_faltando) > 0) {
+    message("ATENÇÃO: alguns IBGEs não bateram no geobr. Ex.: ",
+            paste(head(cods_faltando, 20), collapse = ", "),
+            ifelse(length(cods_faltando) > 20, " ...", ""))
+  }
+  
+  municipios_pontos <- .gerar_pontos_seguro(municipios_geo) |>
+    mutate(
+      label = paste0(name_muni, " (", abbrev_state, ")"),
+      popup = paste0("<b>", name_muni, " (", abbrev_state, ")</b><br>IBGE: ", code_muni)
+    )
+  
+  # 4) FitBounds
+  bb_pts <- sf::st_bbox(municipios_pontos)
+  pad <- 0.9
+  xmin <- as.numeric(unname(bb_pts["xmin"])) - pad
+  ymin <- as.numeric(unname(bb_pts["ymin"])) - pad
+  xmax <- as.numeric(unname(bb_pts["xmax"])) + pad
+  ymax <- as.numeric(unname(bb_pts["ymax"])) + pad
+  
+  # 5) Quadro por região (bottomleft)
+  uf_regiao <- tibble::tribble(
+    ~abbrev_state, ~regiao,
+    "AC","Norte","AL","Nordeste","AP","Norte","AM","Norte","BA","Nordeste",
+    "CE","Nordeste","DF","Centro-Oeste","ES","Sudeste","GO","Centro-Oeste",
+    "MA","Nordeste","MT","Centro-Oeste","MS","Centro-Oeste","MG","Sudeste",
+    "PA","Norte","PB","Nordeste","PR","Sul","PE","Nordeste","PI","Nordeste",
+    "RJ","Sudeste","RN","Nordeste","RO","Norte","RR","Norte","RS","Sul",
+    "SC","Sul","SE","Nordeste","SP","Sudeste","TO","Norte"
+  )
+  
+  cont_regiao <- municipios_pontos |>
+    sf::st_drop_geometry() |>
+    dplyr::select(abbrev_state) |>
+    dplyr::left_join(uf_regiao, by = "abbrev_state") |>
+    dplyr::count(regiao, name = "n") |>
+    dplyr::mutate(regiao = factor(regiao, levels = c("Norte","Nordeste","Centro-Oeste","Sudeste","Sul"))) |>
+    dplyr::arrange(regiao)
+  
+  html_regioes <- paste0(
+    "<div style='background: rgba(255,255,255,0.92);",
+    "border: 1px solid rgba(17,24,39,0.12);",
+    "border-radius: 14px;",
+    "box-shadow: 0 10px 28px rgba(0,0,0,0.18);",
+    "padding: 12px 14px;",
+    "font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;",
+    "color: #111827; min-width: 260px;'>",
+    "<div style='font-size: 18px; font-weight: 800; margin-bottom: 8px;'>Municípios por região</div>",
+    paste0(
+      "<div style='display:flex; justify-content:space-between; font-size: 16px; padding: 3px 0;'>",
+      cont_regiao$regiao, "<span style='font-weight:800;'>", cont_regiao$n, "</span></div>",
+      collapse = ""
+    ),
+    "<div style='height:1px; background: rgba(17,24,39,0.10); margin: 8px 0;'></div>",
+    "<div style='display:flex; justify-content:space-between; font-size: 16px;'>",
+    "<span style='font-weight:700;'>Total</span>",
+    "<span style='font-weight:900;'>", nrow(municipios_pontos), "</span>",
+    "</div>",
+    "</div>"
+  )
+  
+  # 6) Logo (bottomright)
+  logo_uri <- base64enc::dataURI(file = logo_path, mime = "image/png")
+  html_logo <- paste0(
+    "<div style='background: rgba(255,255,255,0.92);",
+    "border: 1px solid rgba(17,24,39,0.12);",
+    "border-radius: 14px;",
+    "box-shadow: 0 10px 28px rgba(0,0,0,0.18);",
+    "padding: 10px 12px; display:flex; align-items:center; justify-content:center;'>",
+    "<img src='", logo_uri, "' style='height:64px; width:auto; display:block;'/>",
+    "</div>"
+  )
+  
+  # 7) Cluster corporativo
+  cor_estados_fill <- "#2B5DAA"
+  cor_pontos_fill  <- "#1E3A8A"
+  
+  css_cluster <- htmltools::tags$style(htmltools::HTML("
+  .marker-cluster.casd-blue-small { background: rgba(30,58,138,0.20); }
+  .marker-cluster.casd-blue-small div { background: rgba(30,58,138,0.85); }
+  .marker-cluster.casd-blue-medium { background: rgba(30,58,138,0.24); }
+  .marker-cluster.casd-blue-medium div { background: rgba(30,58,138,0.92); }
+  .marker-cluster.casd-blue-large { background: rgba(30,58,138,0.28); }
+  .marker-cluster.casd-blue-large div { background: rgba(30,58,138,0.98); }
+  .marker-cluster div{
+    border: 2px solid rgba(255,255,255,0.90);
+    box-shadow: 0 8px 20px rgba(0,0,0,0.22);
+    color: #ffffff;
+    font-weight: 800;
+    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  }
+  .marker-cluster-small div { width: 34px; height: 34px; line-height: 34px; border-radius: 17px; }
+  .marker-cluster-medium div { width: 40px; height: 40px; line-height: 40px; border-radius: 20px; }
+  .marker-cluster-large div { width: 46px; height: 46px; line-height: 46px; border-radius: 23px; }
+  "))
+  
+  icon_create_function <- htmlwidgets::JS("
+  function (cluster) {
+    var count = cluster.getChildCount();
+    var size = 'casd-blue-small';
+    if (count >= 10 && count < 50) size = 'casd-blue-medium';
+    if (count >= 50) size = 'casd-blue-large';
+    return new L.DivIcon({
+      html: '<div><span>' + count + '</span></div>',
+      className: 'marker-cluster ' + size,
+      iconSize: new L.Point(46, 46)
+    });
+  }
+  ")
+  
+  cl <- markerClusterOptions(
+    iconCreateFunction = icon_create_function,
+    spiderfyOnMaxZoom = TRUE,
+    showCoverageOnHover = FALSE,
+    zoomToBoundsOnClick = TRUE,
+    removeOutsideVisibleBounds = TRUE,
+    disableClusteringAtZoom = 8
+  )
+  
+  # 8) Título
+  html_titulo <- paste0(
+    "<div style='background: rgba(255,255,255,0.92);",
+    "border: 1px solid rgba(17,24,39,0.12);",
+    "border-radius: 14px;",
+    "box-shadow: 0 10px 28px rgba(0,0,0,0.18);",
+    "padding: 14px 18px;",
+    "font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;",
+    "color: #111827;'>",
+    "<div style='font-size: 42px; font-weight: 800; line-height: 1.05;'>", titulo, "</div>",
+    "<div style='font-size: 24px; font-weight: 600; opacity: 0.85; margin-top: 6px;'>Total: ",
+    nrow(municipios_pontos), "</div>",
+    "</div>"
+  )
+  
+  # 9) Montar mapa
+  m <- leaflet(options = leafletOptions(preferCanvas = TRUE)) |>
+    addProviderTiles(providers$CartoDB.PositronNoLabels) |>
+    addProviderTiles(providers$CartoDB.PositronOnlyLabels,
+                     options = providerTileOptions(opacity = 0.85)) |>
+    addPolygons(
+      data = mapa_estados,
+      weight = 1,
+      color = "white",
+      fillColor = cor_estados_fill,
+      fillOpacity = 0.18,
+      opacity = 1,
+      smoothFactor = 0.5
+    ) |>
+    addCircleMarkers(
+      data = municipios_pontos,
+      radius = 6,
+      stroke = TRUE,
+      weight = 2,
+      color = "white",
+      fillColor = cor_pontos_fill,
+      fillOpacity = 0.95,
+      label = ~label,
+      popup = ~popup,
+      labelOptions = leaflet::labelOptions(
+        direction = "auto",
+        textsize = "13px",
+        opacity = 0.95,
+        style = list("padding" = "4px 6px")
+      ),
+      clusterOptions = cl
+    ) |>
+    addControl(html = html_titulo,  position = "topright") |>
+    addControl(html = html_regioes, position = "bottomleft") |>
+    addControl(html = html_logo,    position = "bottomright") |>
+    fitBounds(xmin, ymin, xmax, ymax)
+  
+  m <- htmlwidgets::prependContent(m, css_cluster)
+  
+  # 10) Salvar e abrir (sempre em out_dir)
+  aba_slug <- tolower(aba)
+  aba_slug <- gsub("[^a-z0-9]+", "_", aba_slug)
+  aba_slug <- gsub("^_+|_+$", "", aba_slug)
+  
+  if (!dir.exists(out_dir)) dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  out_html <- file.path(out_dir, paste0("mapa_", aba_slug, ".html"))
+  htmlwidgets::saveWidget(m, out_html, selfcontained = TRUE)
+  
+  
+  
+  browseURL(paste0("file:///", normalizePath(out_html, winslash = "/")))
+  
+  cat("\nMapa gerado com sucesso!\n",
+      "Aba: ", aba, "\n",
+      "Título: ", titulo, "\n",
+      "Arquivo: ", normalizePath(out_html, winslash = "/"), "\n", sep = "")
+  
+  invisible(list(map = m, aba = aba, titulo = titulo, out_html = out_html))
+}
