@@ -5,7 +5,8 @@ options(scipen = 999)
 sf::sf_use_s2(FALSE)
 options(jsonlite.warn_vec_names = FALSE)
 
-BASE_DIR <- getwd()
+# Se BASE_DIR não existir, assume o diretório atual
+if (!exists("BASE_DIR")) BASE_DIR <- getwd()
 
 .gerar_pontos_seguro <- function(sf_poligonos_4326) {
   sf_poligonos_3857 <- sf::st_transform(sf_poligonos_4326, 3857)
@@ -15,7 +16,7 @@ BASE_DIR <- getwd()
   sf::st_transform(sf_pontos_3857, 4326)
 }
 
-gerar_mapa <- function(aba, titulo = NULL, arquivo = "municipios.xlsx", logo_nome = "FNP_principal.png", out_dir = getwd()) {
+gerar_mapa_individual <- function(aba, titulo = NULL, arquivo = "municipios.xlsx", logo_nome = "FNP_principal.png", out_dir = getwd()) {
   
   logo_path <- file.path(BASE_DIR, logo_nome)
   arquivo_path <- file.path(BASE_DIR, arquivo)
@@ -23,9 +24,7 @@ gerar_mapa <- function(aba, titulo = NULL, arquivo = "municipios.xlsx", logo_nom
   if (!file.exists(logo_path)) stop("Logo não encontrada: ", logo_path)
   if (!file.exists(arquivo_path)) stop("Excel não encontrado: ", arquivo_path)
 
-  if (is.null(titulo)) {
-    titulo <- aba
-  }
+  if (is.null(titulo)) titulo <- aba
 
   df <- readxl::read_excel(arquivo_path, sheet = aba)
   
@@ -42,14 +41,14 @@ gerar_mapa <- function(aba, titulo = NULL, arquivo = "municipios.xlsx", logo_nom
     TRUE ~ NA_character_
   )
   
-  if (is.na(col_cod)) stop("Coluna de código IBGE não encontrada.")
+  if (is.na(col_cod)) return(NULL) 
   
   municipios_sel <- df |>
     transmute(cod_ibge = as.integer(.data[[col_cod]])) |>
     filter(!is.na(cod_ibge)) |>
     distinct()
   
-  if (nrow(municipios_sel) == 0) stop("Nenhum município válido encontrado na aba.")
+  if (nrow(municipios_sel) == 0) return(NULL)
 
   ler_geobr <- function() {
     mapa_estados <- geobr::read_state(year = 2020, showProgress = FALSE) |> sf::st_transform(4326)
@@ -146,55 +145,70 @@ gerar_mapa <- function(aba, titulo = NULL, arquivo = "municipios.xlsx", logo_nom
     htmlwidgets::prependContent(css_cluster)
   
   aba_slug <- tolower(aba) |> gsub("[^a-z0-9]+", "_", x = _) |> gsub("^_+|_+$", "", x = _)
-  if (!dir.exists(out_dir)) dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  filename <- paste0("mapa_", aba_slug, ".html")
+  out_html <- file.path(out_dir, filename)
   
-  out_html <- file.path(out_dir, paste0("mapa_", aba_slug, ".html"))
-  index_html <- file.path(out_dir, "index.html")
+  # === AQUI ESTÁ A CORREÇÃO DE MEMÓRIA ===
+  # selfcontained = FALSE evita que o Pandoc tente zipar tudo
+  htmlwidgets::saveWidget(m, out_html, selfcontained = FALSE)
   
-  htmlwidgets::saveWidget(m, out_html, selfcontained = TRUE)
-  file.copy(out_html, index_html, overwrite = TRUE)
+  return(list(nome = aba, arquivo = filename))
+}
+
+gerar_site_completo <- function() {
+  arquivo_excel <- file.path(BASE_DIR, "municipios.xlsx")
+  if (!file.exists(arquivo_excel)) stop("Arquivo municipios.xlsx não encontrado.")
+  
+  abas <- readxl::excel_sheets(arquivo_excel)
+  cat("\nIniciando geração de todos os mapas...\n")
+  
+  mapas_gerados <- list()
+  
+  for (aba in abas) {
+    cat("-> Processando aba:", aba, "\n")
+    res <- gerar_mapa_individual(aba, out_dir = BASE_DIR)
+    if (!is.null(res)) {
+      mapas_gerados[[length(mapas_gerados) + 1]] <- res
+    }
+  }
+  
+  html_links <- ""
+  for (m in mapas_gerados) {
+    html_links <- paste0(html_links, 
+      sprintf('<a href="%s" class="btn">%s</a>', m$arquivo, m$nome)
+    )
+  }
+  
+  html_index <- sprintf('
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Painel de Mapas FNP</title>
+    <style>
+        body { font-family: -apple-system, system-ui, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #f3f4f6; color: #111827; margin: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; }
+        .container { background: white; padding: 2rem; border-radius: 1rem; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1); text-align: center; max-width: 400px; width: 90%%; }
+        h1 { font-size: 1.5rem; font-weight: 800; margin-bottom: 0.5rem; color: #1e3a8a; }
+        p { margin-bottom: 2rem; color: #6b7280; }
+        .btn { display: block; width: 100%%; background-color: #2563eb; color: white; padding: 0.75rem 1rem; margin-bottom: 0.75rem; border-radius: 0.5rem; text-decoration: none; font-weight: 600; transition: background-color 0.2s; box-sizing: border-box; }
+        .btn:hover { background-color: #1d4ed8; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Mapas Interativos</h1>
+        <p>Selecione uma visualização abaixo:</p>
+        %s
+    </div>
+</body>
+</html>', html_links)
+  
+  writeLines(html_index, file.path(BASE_DIR, "index.html"), useBytes = TRUE)
   
   cat("\n------------------------------------------------------")
-  cat("\nMAPA GERADO COM SUCESSO!")
-  cat("\nArquivo específico:", out_html)
-  cat("\nArquivo para GitHub (index.html):", index_html)
+  cat("\nSUCESSO! Site gerado com", length(mapas_gerados), "mapas.")
   cat("\n------------------------------------------------------\n")
 }
 
-iniciar_menu_interativo <- function() {
-  arquivo_excel <- file.path(BASE_DIR, "municipios.xlsx")
-  
-  if (!file.exists(arquivo_excel)) {
-    stop("O arquivo municipios.xlsx não foi encontrado na pasta: ", BASE_DIR)
-  }
-  
-  abas <- readxl::excel_sheets(arquivo_excel)
-  
-  cat("\n==========================================================\n")
-  cat(" SELECIONE QUAL MAPA DESEJA PUBLICAR\n")
-  cat("==========================================================\n")
-  
-  for (i in seq_along(abas)) {
-    cat(sprintf(" %d) %s\n", i, abas[i]))
-  }
-  cat(" 0) Sair\n")
-  cat("----------------------------------------------------------\n")
-  
-  escolha <- suppressWarnings(as.integer(readline("Digite o número da opção: ")))
-  
-  if (is.na(escolha) || escolha == 0) {
-    cat("\nOperação cancelada.\n")
-    return(invisible(NULL))
-  }
-  
-  if (escolha > 0 && escolha <= length(abas)) {
-    aba_selecionada <- abas[escolha]
-    cat("\nGerando mapa para:", aba_selecionada, "...\n")
-    gerar_mapa(aba = aba_selecionada)
-  } else {
-    cat("\nOpção inválida. Tente novamente.\n")
-    iniciar_menu_interativo()
-  }
-}
-
-iniciar_menu_interativo()
+gerar_site_completo()
